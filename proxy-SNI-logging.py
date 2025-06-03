@@ -9,6 +9,8 @@ import argparse
 import subprocess  # For openssl calls
 import tempfile # for CSR
 import datetime
+from urllib.parse import urlparse
+
 
 # Configuration
 DEFAULT_PORT = 8080
@@ -183,190 +185,266 @@ def handle_https_connect(client_socket, request_str, address, cert_file, key_fil
     except Exception as e:
         logging.error(f"Error handling HTTPS CONNECT: {e}")
 
-def relay_https_traffic(ssl_client_socket, hostname, port, address, cert_file, key_file, debug):
-    """Relays encrypted traffic between the client and the destination server."""
+
+def relay_https_traffic(ssl_client_socket, hostname, port, address, ca_cert, ca_key, debug):
+    """
+    MITM an HTTPS CONNECT tunnel by intercepting exactly one HTTP request,
+    rewriting it to force Connection: close, sending it upstream, and
+    then forwarding back the full response until EOF.
+    """
+
+    CRLF = '\r\n'
+
+    # 1) Dial out to the real server over TLS (with SNI, no cert checks)
+    plain_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    context    = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    context.check_hostname = False
+    context.verify_mode    = ssl.CERT_NONE
+    ssl_server_socket     = context.wrap_socket(plain_sock, server_hostname=hostname)
+    ssl_server_socket.connect((hostname, port))
+
     try:
-        # Create a socket to the destination server
-        server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        # Wrap the server socket with SSL
-        try:
-            context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-            # The following settings DISABLE CERTIFICATE VERIFICATION, making the
-            # proxy vulnerable to MITM attacks. This is ONLY acceptable for
-            # very specific, controlled use cases where security is not a concern.
-            context.check_hostname = False  # Disable hostname checking
-            context.verify_mode = ssl.CERT_NONE  # Disable certificate verification
-            ssl_server_socket = context.wrap_socket(server_socket, server_hostname=hostname)  # SNI!
-        except Exception as e:
-            logging.error(f"Error wrapping server socket with SSL: {e}")
-            return
-        try:
-            ssl_server_socket.connect((hostname, port))
-        except Exception as e:
-            logging.error(f"Error connecting to {hostname}:{port}: {e}")
-            return  # Exit if cannot connect
-        # Relay data between the client and the server
-        sockets = [ssl_client_socket, ssl_server_socket]  # Using SSL wrapped sockets.
+        # 2) Read one full HTTP request (headers+body) from the client‐side TLS
+        head, body = recv_full_request(ssl_client_socket)
+
+        # 3) Split into lines and pull out the request‐line + any original Host:
+        text_lines   = head.decode('iso-8859-1').split(CRLF)
+        request_line = text_lines[0]
+        method, path, version = request_line.split(' ', 2)
+
+        orig_host_val = None
+        filtered     = []
+        for hdr in text_lines[1:]:
+            if not hdr:
+                continue
+            name, _, val = hdr.partition(':')
+            nl = name.strip().lower()
+            # drop proxy-*, host, and connection headers
+            if nl.startswith('proxy-'):
+                continue
+            if nl == 'host':
+                orig_host_val = val.strip()
+                continue
+            if nl == 'connection':
+                continue
+            filtered.append(hdr)
+
+        # 4) Rebuild the header block
+        new_lines = [f"{method} {path} {version}"]
+        new_lines += filtered
+
+        # 5) Insert exactly one Host: header
+        if orig_host_val:
+            new_lines.append(f"Host: {orig_host_val}")
+        else:
+            # fallback to the CONNECT target
+            hostport = hostname if port in (80, 443) else f"{hostname}:{port}"
+            new_lines.append(f"Host: {hostport}")
+
+        # 6) Force the upstream server to close
+        new_lines.append("Connection: close")
+
+        # 7) Reassemble with real CRLFs
+        new_head    = CRLF.join(new_lines) + CRLF + CRLF
+        new_request = new_head.encode('iso-8859-1') + body
+
+        if debug:
+            logging.debug(">> [HTTPS‐MITM] Rewritten upstream request:\n%s", new_head)
+
+        # 8) Send the single request into the server‐side TLS
+        ssl_server_socket.sendall(new_request)
+
+        # 9) Relay the full response until the server closes (EOF)
         while True:
-            readable, _, _ = select.select(sockets, [], [])
-            for sock in readable:
-                if sock is ssl_client_socket:
-                    try:
-                        data = ssl_client_socket.recv(262144)
-                    except ssl.SSLError as e:
-                        logging.warning(f"SSL Error receiving from client: {e}")
-                        data = None  # Break the loop if there's an SSL error
-                    if not data:
-                        logging.info(f"Client {address} disconnected.")
-                        return
-                    if debug:
-                        try:
-                            request_str = data.decode('utf-8', errors='ignore')
-                            logging.info(f"Full HTTPS Request from Client to Server:n{request_str}")
-                        except:
-                            logging.info("Could not decode HTTPS Request from Client to Server for debugging")
+            chunk = ssl_server_socket.recv(524288)
+            if not chunk:
+                break
+            ssl_client_socket.sendall(chunk)
+            if debug:
+                try:
+                    logging.debug("<< [HTTPS‐MITM] chunk:\n%s",
+                                  chunk.decode('utf-8', 'ignore'))
+                except:
+                    logging.debug("<< [HTTPS‐MITM] binary chunk %d bytes", len(chunk))
 
-                    if data:
-                        try:
-                            request_str = data.decode('utf-8', errors='ignore')
-                            request_time = datetime.datetime.now()
-                            log_traffic(hostname, request=request_str, request_time=request_time) # Log HTTPS request
-
-                        except:
-                            logging.info("Could not decode HTTPS Request from Client to Server for logging")
-                    logging.debug(f"Received {len(data)} bytes from client {address} for {hostname}:{port}")
-                    ssl_server_socket.sendall(data)  # Send encrypted data to the server
-                else:
-                    try:
-                        data = ssl_server_socket.recv(262144)
-                    except ConnectionResetError:
-                        logging.warning(f"Server {hostname}:{port} disconnected.")
-                        return
-                    if not data:
-                        logging.info(f"Server {hostname}:{port} disconnected.")
-                        return
-                    if debug:
-                        try:
-                            response_str = data.decode('utf-8', errors='ignore')
-                            logging.info(f"Full HTTPS Response from Server to Client:n{response_str}")
-                        except:
-                            logging.info("Could not decode HTTPS Response from Server to Client for debugging")
-
-                    if data:
-                        try:
-                            response_str = data.decode('utf-8', errors='ignore')
-                            response_time = datetime.datetime.now()
-                            log_traffic(hostname, response=response_str, response_time=response_time) # Log HTTPS response
-
-                        except:
-                            logging.info("Could not decode HTTPS Response from Server to Client for logging")
-                    logging.debug(f"Received {len(data)} bytes from server {hostname}:{port} for client {address}")
-                    try:
-                        ssl_client_socket.sendall(data)  # Send encrypted data to the client
-                    except ssl.SSLError as e:
-                        logging.warning(f"SSL Error sending to client: {e}")
-                        return  # Stop relaying if we can't send due to SSL errors
     except Exception as e:
-        logging.error(f"Error relaying HTTPS traffic for {hostname}:{port}: {e}")
+        logging.error(f"Error in relay_https_traffic({hostname}:{port}): {e}")
     finally:
         try:
             ssl_server_socket.close()
-            ssl_client_socket.close()  # Close the SSL wrapped socket.
-        except Exception:
-            pass  # Socket may already be closed.
+        except:
+            pass
+        try:
+            ssl_client_socket.close()
+        except:
+            pass
+
+
+
+
 
 def handle_client(client_socket, address, cert_file, key_file, debug):
-    """Handles a single client connection."""
+    """
+    Top‐level per‐connection handler.  Grabs the first recv(),
+    then dispatches to HTTP or HTTPS paths.
+    """
     try:
-        request = client_socket.recv(262144)
-        if not request:
-            logging.warning(f"Empty request from {address}. Closing connection.")
+        initial = client_socket.recv(524288)
+        if not initial:
             return
-
-        request_str = request.decode('utf-8', errors='ignore')  # Decode the request
-        logging.debug(f"Received request from {address}:\n{request_str}")
-
-        # Determine if it's an HTTP CONNECT (for HTTPS) or a regular HTTP request
-        if request_str.startswith('CONNECT'):
-            # Handle HTTPS CONNECT request (Man-in-the-Middle)
-            handle_https_connect(client_socket, request_str, address, cert_file, key_file, debug)
+        text = initial.decode('utf-8', 'ignore')
+        if text.startswith('CONNECT'):
+            # your existing HTTPS‐MITM handler
+            handle_https_connect(client_socket, text, address, cert_file, key_file, debug)
         else:
-            # Handle regular HTTP request
-            handle_http_request(client_socket, request, debug)
-
-    except ConnectionResetError:
-        logging.warning(f"Connection reset by peer: {address}")
+            handle_http_request(client_socket, initial, debug)
     except Exception as e:
-        logging.error(f"Error handling client {address}: {e}")
+        logging.error(f"Error in handle_client({address}): {e}")
     finally:
         try:
             client_socket.close()
-        except Exception:
-            pass  # Socket may already be closed.
+        except:
+            pass
 
-def handle_http_request(client_socket, request, debug):
-    """Handles a regular HTTP request."""
+
+def recv_full_request(client_sock, initial_data=b''):
+    """
+    Read from client_sock until we have seen the end of headers (\r\n\r\n),
+    then if there is a Content-Length header, read exactly that many bytes
+    of body before returning. initial_data is any bytes you already pulled.
+    Returns: (head_bytes, body_bytes)
+    """
+    data = initial_data
+    # 1) read until headers end
+    while b'\r\n\r\n' not in data:
+        chunk = client_sock.recv(524288)
+        if not chunk:
+            break
+        data += chunk
+
+    # split once on the header/body boundary
+    head, sep, rest = data.partition(b'\r\n\r\n')
+    header_lines = head.decode('iso-8859-1').split('\r\n')
+
+    # 2) find Content-Length
+    content_length = 0
+    for line in header_lines:
+        if line.lower().startswith('content-length:'):
+            try:
+                content_length = int(line.split(':', 1)[1].strip())
+            except ValueError:
+                content_length = 0
+            break
+
+    # 3) read the remainder of the body (if any)
+    body = rest
+    to_read = content_length - len(body)
+    while to_read > 0:
+        chunk = client_sock.recv(min(524288, to_read))
+        if not chunk:
+            break
+        body += chunk
+        to_read -= len(chunk)
+
+    return head, body
+
+
+def handle_http_request(client_socket, initial_buffer, debug=False):
+    """
+    Reads full HTTP request (headers+body), rewrites the request‐line to a
+    relative path + Host:, forwards it to the origin, relays the response
+    back, and in debug mode logs the full response.
+    """
     try:
-        # Parse the request (basic example)
-        request_str = request.decode('utf-8', errors='ignore')
-        first_line = request_str.split('n')[0]
-        method, path, _ = first_line.split(' ') if len(first_line.split(' ')) == 3 else (None, None, None)
-        if not method or not path:
-            logging.warning(f"Invalid HTTP request: {first_line}")
+        # A) Read full headers+body, seeding with the bytes you already have
+        head_bytes, body = recv_full_request(client_socket, initial_buffer)
+
+        # B) Split into text lines to rewrite the request‐line + headers
+        head_str = head_bytes.decode('iso-8859-1')
+        lines = head_str.split('\r\n')
+        if not lines or ' ' not in lines[0]:
+            logging.warning("Invalid HTTP request-line, dropping")
             return
-        # Forward the request to the destination server
-        try:
-            # Extract hostname and port. Handles both relative and absolute URLs.
-            if path.startswith('http'):
-                hostname = path.split('/')[2]
+
+        method, full_url, version = lines[0].split(' ', 2)
+        parsed = urlparse(full_url)
+
+        # build the relative path
+        path = parsed.path or '/'
+        if parsed.query:
+            path += '?' + parsed.query
+
+        # C) Rebuild the headers
+        new_lines = [f"{method} {path} {version}"]
+        saw_host = False
+        for hdr in lines[1:]:
+            if not hdr:
+                continue
+            name, _, val = hdr.partition(':')
+            nl = name.strip().lower()
+            # strip proxy-* headers
+            if nl.startswith('proxy-'):
+                continue
+            # rewrite Host
+            if nl == 'host':
+                new_lines.append(f"Host: {parsed.netloc}")
+                saw_host = True
             else:
-                # For relative paths, extract from the 'Host' header
-                host_header = next((line for line in request_str.split('n') if line.startswith('Host:')), None)
-                if host_header:
-                    hostname = host_header.split(': ')[1].strip()  # Extract hostname
-                else:
-                    logging.warning("Host header not found in request.")
-                    return  # Can't proceed without a host.
-                if not hostname:
-                    logging.warning("Hostname is empty")
-                    return
-            port = 80  # Default HTTP port
-            if ':' in hostname:
-                hostname, port_str = hostname.split(':')
-                port = int(port_str)
-            logging.info(f"Forwarding HTTP request to {hostname}:{port}")
+                new_lines.append(hdr)
+        if not saw_host:
+            new_lines.append(f"Host: {parsed.netloc}")
 
-            # Log the request
-            request_time = datetime.datetime.now()
-            log_traffic(hostname, request=request_str, request_time=request_time)  # Log request
+        # D) Re-assemble the request
+        new_head = '\r\n'.join(new_lines) + '\r\n\r\n'
+        new_request = new_head.encode('iso-8859-1') + body
 
-            server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            server_socket.connect((hostname, port))
-            server_socket.sendall(request)  # Send the original request
+        if debug:
+            logging.debug(">> Rewritten Request HEADERS:\n%s", new_head)
+            if body:
+                logging.debug(">> Rewritten Request BODY (%d bytes): %r",
+                              len(body),
+                              body[:100] + (b'...' if len(body) > 100 else b''))
+
+        # E) Open a TCP connection to the real server
+        host, sep, port = parsed.netloc.partition(':')
+        port = int(port) if sep else 80
+        server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        server.connect((host, port))
+
+        # F) Send the full request
+        server.sendall(new_request)
+
+        # G) Relay + capture the response
+        response_chunks = []
+        while True:
+            chunk = server.recv(524288)
+            if not chunk:
+                break
+            client_socket.sendall(chunk)
+            response_chunks.append(chunk)
+
+            # per‐chunk debug (optional)
             if debug:
-                logging.info(f"Full HTTP Request:n{request_str}")
-            # Relay the response back to the client
-            response_parts = []
-            while True:
-                response = server_socket.recv(262144)
-                if not response:
-                    break
-                client_socket.sendall(response)
-                response_parts.append(response)
-            if debug:
-                response_str = b''.join(response_parts).decode('utf-8', errors='ignore')
-                logging.info(f"Full HTTP Response:n{response_str}")
+                try:
+                    logging.debug("<< Response chunk:\n%s",
+                                  chunk.decode('utf-8', 'ignore'))
+                except:
+                    logging.debug("<< Binary response chunk: %d bytes", len(chunk))
 
-            # Log the response
-            response_time = datetime.datetime.now()
-            response_str = b''.join(response_parts).decode('utf-8', errors='ignore')
-            log_traffic(hostname, response=response_str, response_time=response_time)  # Log response
+        # H) In debug, dump the full response once
+        if debug and response_chunks:
+            full_resp = b''.join(response_chunks).decode('utf-8', 'ignore')
+            logging.debug("<< Full HTTP response:\n%s", full_resp)
 
-            server_socket.close()
-        except Exception as e:
-            logging.error(f"Error forwarding HTTP request: {e}")
+        server.close()
+
     except Exception as e:
         logging.error(f"Error handling HTTP request: {e}")
+
+
+
+
+
 
 def main():
     parser = argparse.ArgumentParser(description='Simple HTTP/HTTPS Forwarding Proxy')
