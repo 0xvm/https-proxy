@@ -253,6 +253,7 @@ def relay_https_traffic(ssl_client_socket, hostname, port, address, ca_cert, ca_
 
         # 8) Send the single request into the server‐side TLS
         ssl_server_socket.sendall(new_request)
+        log_traffic(orig_host_val, request=new_request, request_time=datetime.datetime.now())
 
         # 9) Relay the full response until the server closes (EOF)
         while True:
@@ -260,6 +261,7 @@ def relay_https_traffic(ssl_client_socket, hostname, port, address, ca_cert, ca_
             if not chunk:
                 break
             ssl_client_socket.sendall(chunk)
+            log_traffic(orig_host_val, request=chunk, response_time=datetime.datetime.now())
             if debug:
                 try:
                     logging.debug("<< [HTTPS‐MITM] chunk:\n%s",
@@ -413,6 +415,7 @@ def handle_http_request(client_socket, initial_buffer, debug=False):
 
         # F) Send the full request
         server.sendall(new_request)
+        log_traffic(host, request=new_request, request_time=datetime.datetime.now())
 
         # G) Relay + capture the response
         response_chunks = []
@@ -435,6 +438,7 @@ def handle_http_request(client_socket, initial_buffer, debug=False):
         if debug and response_chunks:
             full_resp = b''.join(response_chunks).decode('utf-8', 'ignore')
             logging.debug("<< Full HTTP response:\n%s", full_resp)
+            log_traffic(host, request=full_resp, response_time=datetime.datetime.now())
 
         server.close()
 
